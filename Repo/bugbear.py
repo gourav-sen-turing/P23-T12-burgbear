@@ -43,9 +43,17 @@ class BugBearChecker:
                 yield self.adapt_error(e)
 
     def gen_line_based_checks(self):
+        for lineno, line in enumerate(self.lines, 1):
+            # Skip lines with noqa
+            if '# noqa' in line:
+                continue
 
-        return
-        yield
+            # B950: Line too long (with 10% tolerance)
+            length = len(line.rstrip())
+            limit = self.max_line_length
+            # Allow 10% tolerance
+            if length > limit * 1.1:
+                yield B950(lineno, length, vars=(length, limit))
 
     @classmethod
     def adapt_error(cls, e):
@@ -127,27 +135,87 @@ class BugBearVisitor(ast.NodeVisitor):
         self.node_stack.pop()
 
     def visit_ExceptHandler(self, node):
+        if node.type is None:
+            self.errors.append(B001(node.lineno, node.col_offset))
         self.generic_visit(node)
 
-    def visit_UAdd(self, node):
+    def visit_UnaryOp(self, node):
+        if isinstance(node.op, ast.UAdd) and isinstance(node.operand, ast.UnaryOp) and isinstance(node.operand.op, ast.UAdd):
+            self.errors.append(B002(node.lineno, node.col_offset))
         self.generic_visit(node)
 
     def visit_Call(self, node):
+        self.check_for_b004(node)
+        self.check_for_b005(node)
         self.generic_visit(node)
 
     def visit_Attribute(self, node):
+        # Get the call path to check for valid prefixes
+        call_path = list(self.compose_call_path(node))
+
+        # Check for B301, B302, B305
+        if node.attr in B301.methods:
+            # Check if it has a valid prefix
+            if len(call_path) >= 2:
+                prefix = '.'.join(call_path[:-1])
+                if prefix not in B301.valid_paths:
+                    self.errors.append(B301(node.lineno, node.col_offset))
+            else:
+                self.errors.append(B301(node.lineno, node.col_offset))
+        elif node.attr in B302.methods:
+            # Check if it has a valid prefix
+            if len(call_path) >= 2:
+                prefix = '.'.join(call_path[:-1])
+                if prefix not in B302.valid_paths:
+                    self.errors.append(B302(node.lineno, node.col_offset))
+            else:
+                self.errors.append(B302(node.lineno, node.col_offset))
+        elif node.attr in B305.methods:
+            # Check if it has a valid prefix
+            if len(call_path) >= 2:
+                prefix = '.'.join(call_path[:-1])
+                if prefix not in B305.valid_paths:
+                    self.errors.append(B305(node.lineno, node.col_offset))
+            else:
+                self.errors.append(B305(node.lineno, node.col_offset))
+        elif node.attr == 'message' and isinstance(node.value, ast.Name):
+            # Check for B306 - BaseException.message
+            # Only flag if it looks like an exception variable (short name, common patterns)
+            name = node.value.id
+            if len(name) <= 3 or name in {'exc', 'exception', 'error', 'err'}:
+                self.errors.append(B306(node.lineno, node.col_offset))
+        elif node.attr == 'maxint' and isinstance(node.value, ast.Name) and node.value.id == 'sys':
+            # Check for B304 - sys.maxint
+            self.errors.append(B304(node.lineno, node.col_offset))
         self.generic_visit(node)
 
     def visit_Assign(self, node):
+        for target in node.targets:
+            if (isinstance(target, ast.Attribute) and
+                isinstance(target.value, ast.Name) and
+                target.value.id == 'os' and
+                target.attr == 'environ'):
+                self.errors.append(B003(node.lineno, node.col_offset))
+            elif isinstance(target, ast.Name) and target.id == '__metaclass__':
+                # Check if we're in a class
+                for n in self.node_stack:
+                    if isinstance(n, ast.ClassDef):
+                        self.errors.append(B303(node.lineno, node.col_offset))
+                        break
         self.generic_visit(node)
 
     def visit_For(self, node):
+        self.check_for_b007(node)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
+        self.check_for_b006(node)
+        self.check_for_b901(node)
+        self.check_for_b902(node)
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
+        self.check_for_b903(node)
         self.generic_visit(node)
 
     def compose_call_path(self, node):
@@ -157,23 +225,291 @@ class BugBearVisitor(ast.NodeVisitor):
         elif isinstance(node, ast.Name):
             yield node.id
 
+    def check_for_b004(self, node):
+        if (isinstance(node.func, ast.Name) and
+            (node.func.id == 'hasattr' or node.func.id == 'getattr')):
+            if len(node.args) >= 2:
+                arg = node.args[1]
+                if isinstance(arg, ast.Str):
+                    if arg.s == '__call__':
+                        self.errors.append(B004(node.lineno, node.col_offset))
+                elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if arg.value == '__call__':
+                        self.errors.append(B004(node.lineno, node.col_offset))
+
     def check_for_b005(self, node):
-        return
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {'strip', 'lstrip', 'rstrip'}:
+            if len(node.args) == 1:
+                arg = node.args[0]
+                if isinstance(arg, ast.Str):
+                    value = arg.s
+                elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    value = arg.value
+                else:
+                    return
+
+                # Check if it's a multi-character string that looks like a substring
+                # rather than a character set
+                if len(value) > 1 and not (set(value) <= {' ', '\t', '\n', '\r', '\f', '\v'}):
+                    # Warn if it contains special characters that make it look like a path/URL/escape
+                    if any(c in value for c in '.:/\\'):
+                        self.errors.append(B005(node.lineno, node.col_offset))
 
     def check_for_b006(self, node):
-        return
+        for default in node.args.defaults + node.args.kw_defaults:
+            if default is None:
+                continue
+            if self._is_mutable_default(default):
+                self.errors.append(B006(default.lineno, default.col_offset))
+
+    def _is_mutable_default(self, node):
+        if isinstance(node, ast.List):
+            return True
+        if isinstance(node, ast.Dict):
+            return True
+        if isinstance(node, ast.Set):
+            return True
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in B006.mutable_calls:
+                    return True
+            elif isinstance(node.func, ast.Attribute):
+                call_path = '.'.join(self.compose_call_path(node.func))
+                if call_path in B006.mutable_calls:
+                    return True
+        return False
 
     def check_for_b007(self, node):
-        return
+        # Find all names defined in the loop target
+        names = self._get_names_from_target(node.target)
+
+        # Check if they are used in the loop body
+        for name in names:
+            if name.id == '_':  # underscore is okay
+                continue
+            name_finder = NameFinder()
+            # Only check the body of this loop, not nested loops
+            for stmt in node.body:
+                name_finder.visit(stmt)
+
+            if name.id not in name_finder.names:
+                self.errors.append(B007(name.lineno, name.col_offset, vars=(name.id,)))
+
+    def _get_names_from_target(self, target):
+        if isinstance(target, ast.Name):
+            return [target]
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names = []
+            for elt in target.elts:
+                names.extend(self._get_names_from_target(elt))
+            return names
+        else:
+            return []
 
     def check_for_b901(self, node):
-        return
+        # Check if function has both yield and return with value
+        has_yield = False
+        return_nodes = []
+
+        # Use a custom visitor to avoid nested functions
+        class FunctionBodyVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.has_yield = False
+                self.return_nodes = []
+
+            def visit_FunctionDef(self, node):
+                # Don't visit nested functions
+                pass
+
+            def visit_AsyncFunctionDef(self, node):
+                # Don't visit nested functions
+                pass
+
+            def visit_Yield(self, node):
+                self.has_yield = True
+                self.generic_visit(node)
+
+            def visit_YieldFrom(self, node):
+                self.has_yield = True
+                self.generic_visit(node)
+
+            def visit_Return(self, node):
+                if node.value is not None:
+                    self.return_nodes.append(node)
+                self.generic_visit(node)
+
+        visitor = FunctionBodyVisitor()
+        for stmt in node.body:
+            visitor.visit(stmt)
+
+        if visitor.has_yield and visitor.return_nodes:
+            for return_node in visitor.return_nodes:
+                self.errors.append(B901(return_node.lineno, return_node.col_offset))
 
     def check_for_b902(self, node):
-        return
+        if not self.node_stack:
+            return
+
+        # Check if this function is inside a class
+        parent = None
+        for i in range(len(self.node_stack) - 1, -1, -1):
+            if isinstance(self.node_stack[i], ast.ClassDef):
+                parent = self.node_stack[i]
+                break
+            elif isinstance(self.node_stack[i], (ast.FunctionDef, ast.AsyncFunctionDef)) and self.node_stack[i] != node:
+                # If we hit another function before finding a class, this is a nested function
+                return
+
+        if not parent:
+            return
+
+        # Skip static methods
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Name) and decorator.id == 'staticmethod':
+                return
+
+        # Get expected first argument name
+        is_classmethod = any(
+            isinstance(decorator, ast.Name) and decorator.id == 'classmethod'
+            for decorator in node.decorator_list
+        )
+
+        # Check if parent is a metaclass
+        is_metaclass = False
+        if parent.bases:
+            for base in parent.bases:
+                if isinstance(base, ast.Name) and base.id == 'type':
+                    is_metaclass = True
+                    break
+
+        if is_classmethod or node.name in B902.implicit_classmethods:
+            if is_metaclass:
+                expected = B902.metacls
+                method_type = 'metaclass class'
+            else:
+                expected = B902.cls
+                method_type = 'class'
+        else:
+            if is_metaclass:
+                expected = B902.cls
+                method_type = 'metaclass instance'
+            else:
+                expected = B902.self
+                method_type = 'instance'
+
+        # Check first argument
+
+        if not node.args.args and not node.args.posonlyargs:
+            # No positional arguments at all
+            if node.args.vararg:
+                # Only *args (and maybe **kwargs)
+                self.errors.append(B902(node.args.vararg.lineno, node.args.vararg.col_offset,
+                                      vars=('*' + node.args.vararg.arg, method_type, expected[0])))
+            elif node.args.kwonlyargs:
+                # Only keyword-only args
+                first_kwonly = node.args.kwonlyargs[0]
+                self.errors.append(B902(first_kwonly.lineno, first_kwonly.col_offset,
+                                      vars=('*, ' + first_kwonly.arg, method_type, expected[0])))
+            elif node.args.kwarg:
+                # Only **kwargs
+                self.errors.append(B902(node.args.kwarg.lineno, node.args.kwarg.col_offset,
+                                      vars=('**' + node.args.kwarg.arg, method_type, expected[0])))
+            else:
+                # No arguments at all
+                self.errors.append(B902(node.lineno, node.col_offset,
+                                      vars=('(none)', method_type, expected[0])))
+        else:
+            # Get first argument
+            if node.args.posonlyargs:
+                first_arg = node.args.posonlyargs[0]
+            elif node.args.args:
+                first_arg = node.args.args[0]
+            else:
+                return
+
+            if first_arg.arg not in expected:
+                self.errors.append(B902(first_arg.lineno, first_arg.col_offset,
+                                      vars=(repr(first_arg.arg), method_type, expected[0])))
 
     def check_for_b903(self, node):
-        return
+        """Check for simple data classes that could use namedtuple or __slots__."""
+        # Check if class already has __slots__
+        has_slots = any(
+            isinstance(item, ast.Assign) and
+            any(isinstance(target, ast.Name) and target.id == '__slots__'
+                for target in item.targets)
+            for item in node.body
+            if isinstance(item, ast.Assign)
+        )
+
+        if has_slots:
+            return
+
+        # Find all methods and class attributes
+        methods = []
+        class_attrs = []
+
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                methods.append(item)
+            elif isinstance(item, ast.Assign):
+                class_attrs.append(item)
+            elif isinstance(item, ast.AnnAssign):
+                class_attrs.append(item)
+            # Ignore docstrings (Expr nodes with Str/Constant)
+            elif isinstance(item, ast.Expr):
+                if isinstance(item.value, (ast.Str, ast.Constant)):
+                    continue
+                else:
+                    # Other expressions are considered class attributes
+                    class_attrs.append(item)
+
+        # Check if there are any class attributes
+        if class_attrs:
+            return
+
+        # Check if there's exactly one method and it's __init__
+        if len(methods) != 1 or methods[0].name != '__init__':
+            return
+
+        init_method = methods[0]
+
+        # Check if __init__ only contains simple assignments
+        # Skip the docstring if present
+        body = init_method.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, (ast.Str, ast.Constant)):
+            if isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                body = body[1:]
+            elif isinstance(body[0].value, ast.Str):
+                body = body[1:]
+
+        # Must have at least one assignment
+        if not body:
+            return
+
+        # All remaining statements should be simple assignments of the form self.x = x
+        for stmt in body:
+            if not isinstance(stmt, ast.Assign):
+                return
+
+            # Should have exactly one target
+            if len(stmt.targets) != 1:
+                return
+
+            target = stmt.targets[0]
+
+            # Target should be an attribute of self
+            if not (isinstance(target, ast.Attribute) and
+                    isinstance(target.value, ast.Name) and
+                    target.value.id == 'self'):
+                return
+
+            # Value should be a simple name (parameter)
+            if not isinstance(stmt.value, ast.Name):
+                return
+
+        # If we get here, it's a simple data class
+        self.errors.append(B903(node.lineno, node.col_offset))
 
 
 @attr.s
@@ -183,11 +519,7 @@ class NameFinder(ast.NodeVisitor):
 
     def visit_Name(self, node):
         self.names.setdefault(node.id, []).append(node)
-
-    def visit(self, node):
-        """Like super-visit but doesn't invoke visit_Name."""
-        for child in ast.iter_child_nodes(node):
-            self.visit(child)
+        self.generic_visit(node)
 
 
 def _is_identifier(arg):
