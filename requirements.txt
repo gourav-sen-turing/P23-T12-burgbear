@@ -1,0 +1,12 @@
+# Core dependencies
+flake8
+
+# Development dependencies
+pytest
+setuptools
+wheel
+tox
+
+# Testing
+coverage
+hypothesis
