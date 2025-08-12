@@ -43,23 +43,18 @@ class BugBearChecker:
                 yield self.adapt_error(e)
 
     def gen_line_based_checks(self):
-        """gen_line_based_checks() -> (error, error, error, ...)
 
-        The following simple checks are based on the raw lines, not the AST.
-        """
-        for lineno, line in enumerate(self.lines, start=1):
-            length = len(line) - 1
-            if length > 1.1 * self.max_line_length:
-                yield B950(
-                    lineno,
-                    length,
-                    vars=(length, self.max_line_length),
-                )
+        return
+        yield
 
     @classmethod
     def adapt_error(cls, e):
         """Adapts the extended error namedtuple to be compatible with Flake8."""
-        return e._replace(message=e.message.format(*e.vars))[:4]
+        try:
+            formatted_message = e.message.format(*e.vars)
+        except (IndexError, KeyError):
+            formatted_message = e.message.format(vars=e.vars[0] if len(e.vars) == 1 else e.vars)
+        return e._replace(message=formatted_message)[:4]
 
     def load_file(self):
         """Loads the file in a way that auto-detects source encoding and deals
@@ -77,8 +72,8 @@ class BugBearChecker:
         if not self.tree:
             self.tree = ast.parse("".join(self.lines))
 
-    @staticmethod
-    def add_options(optmanager):
+    @classmethod
+    def add_options(cls, optmanager):
         """Informs flake8 to ignore B9xx by default."""
         optmanager.extend_default_ignore(disabled_by_default)
 
@@ -90,32 +85,20 @@ class BugBearChecker:
         `ignore = ` in configuration.  This is problematic because it means
         specifying anything in `ignore = ` implicitly enables all optional
         warnings.  This function is a workaround for this behavior.
-
-        As documented in the READM, the user is expected to explicitly select
-        the warnings.
         """
-        if code[:2] != 'B9':
-            # Normal warnings are safe for emission.
-            return True
-
         if self.options is None:
-            LOG.info(
-                "Options not provided to Bugbear, optional warning %s selected.",
-                code,
-            )
+            LOG.info("Options not provided to Bugbear, optional warning %s selected.", code)
             return True
 
-        for i in range(2, len(code) + 1):
-            if code[:i] in self.options.select:
+        for i in self.options.select:
+            if code.startswith(i):
                 return True
 
-        LOG.info(
-            "Optional warning %s not present in selected warnings: %r. Not "
-            "firing it at all.",
-            code,
-            self.options.select,
-        )
-        return False
+        for i in self.options.ignore + self.options.extend_ignore:
+            if code.startswith(i):
+                return False
+
+        return code not in disabled_by_default
 
 
 @attr.s
@@ -144,90 +127,27 @@ class BugBearVisitor(ast.NodeVisitor):
         self.node_stack.pop()
 
     def visit_ExceptHandler(self, node):
-        if node.type is None:
-            self.errors.append(
-                B001(node.lineno, node.col_offset)
-            )
         self.generic_visit(node)
 
     def visit_UAdd(self, node):
-        trailing_nodes = list(map(type, self.node_window[-4:]))
-        if trailing_nodes == [ast.UnaryOp, ast.UAdd, ast.UnaryOp, ast.UAdd]:
-            originator = self.node_window[-4]
-            self.errors.append(
-                B002(originator.lineno, originator.col_offset)
-            )
         self.generic_visit(node)
 
     def visit_Call(self, node):
-        if isinstance(node.func, ast.Attribute):
-            for bug in (B301, B302, B305):
-                if node.func.attr in bug.methods:
-                    call_path = '.'.join(self.compose_call_path(node.func.value))
-                    if call_path not in bug.valid_paths:
-                        self.errors.append(
-                            bug(node.lineno, node.col_offset)
-                        )
-                    break
-            else:
-                self.check_for_b005(node)
-        else:
-            with suppress(AttributeError, IndexError):
-                if (
-                    node.func.id in ('getattr', 'hasattr') and
-                    node.args[1].s == '__call__'
-                ):
-                    self.errors.append(
-                        B004(node.lineno, node.col_offset)
-                    )
-
         self.generic_visit(node)
 
     def visit_Attribute(self, node):
-        call_path = list(self.compose_call_path(node))
-        if '.'.join(call_path) == 'sys.maxint':
-            self.errors.append(
-                B304(node.lineno, node.col_offset)
-            )
-        elif len(call_path) == 2 and call_path[1] == 'message':
-            name = call_path[0]
-            for elem in reversed(self.node_stack[:-1]):
-                if isinstance(elem, ast.ExceptHandler) and elem.name == name:
-                    self.errors.append(
-                        B306(node.lineno, node.col_offset)
-                    )
-                    break
+        self.generic_visit(node)
 
     def visit_Assign(self, node):
-        if isinstance(self.node_stack[-2], ast.ClassDef):
-            # note: by hasattr belowe we're ignoring starred arguments, slices
-            # and tuples for simplicity.
-            assign_targets = {t.id for t in node.targets if hasattr(t, 'id')}
-            if '__metaclass__' in assign_targets:
-                self.errors.append(
-                    B303(node.lineno, node.col_offset)
-                )
-        elif len(node.targets) == 1:
-            t = node.targets[0]
-            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name):
-                if (t.value.id, t.attr) == ('os', 'environ'):
-                    self.errors.append(
-                        B003(node.lineno, node.col_offset)
-                    )
         self.generic_visit(node)
 
     def visit_For(self, node):
-        self.check_for_b007(node)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
-        self.check_for_b901(node)
-        self.check_for_b902(node)
-        self.check_for_b006(node)
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
-        self.check_for_b903(node)
         self.generic_visit(node)
 
     def compose_call_path(self, node):
@@ -238,227 +158,76 @@ class BugBearVisitor(ast.NodeVisitor):
             yield node.id
 
     def check_for_b005(self, node):
-        if node.func.attr not in B005.methods:
-            return  # method name doesn't match
-
-        if len(node.args) != 1 or not isinstance(node.args[0], ast.Str):
-            return  # used arguments don't match the builtin strip
-
-        call_path = '.'.join(self.compose_call_path(node.func.value))
-        if call_path in B005.valid_paths:
-            return  # path is exempt
-
-        s = node.args[0].s
-        if len(s) == 1:
-            return  # stripping just one character
-
-        if len(s) == len(set(s)):
-            return  # no characters appear more than once
-
-        self.errors.append(
-            B005(node.lineno, node.col_offset)
-        )
+        return
 
     def check_for_b006(self, node):
-        for default in node.args.defaults:
-            if isinstance(default, B006.mutable_literals):
-                self.errors.append(
-                    B006(default.lineno, default.col_offset)
-                )
-            elif isinstance(default, ast.Call):
-                call_path = '.'.join(self.compose_call_path(default.func))
-                if call_path in B006.mutable_calls:
-                    self.errors.append(
-                        B006(default.lineno, default.col_offset)
-                    )
+        return
 
     def check_for_b007(self, node):
-        targets = NameFinder()
-        targets.visit(node.target)
-        ctrl_names = set(filter(lambda s: not s.startswith('_'), targets.names))
-        body = NameFinder()
-        for expr in node.body:
-            body.visit(expr)
-        used_names = set(body.names)
-        for name in sorted(ctrl_names - used_names):
-            n = targets.names[name][0]
-            self.errors.append(B007(n.lineno, n.col_offset, vars=(name,)))
+        return
 
     def check_for_b901(self, node):
-        xs = list(node.body)
-        has_yield = False
-        return_node = None
-        while xs:
-            x = xs.pop()
-            if isinstance(x, (ast.AsyncFunctionDef, ast.FunctionDef)):
-                continue
-            elif isinstance(x, (ast.Yield, ast.YieldFrom)):
-                has_yield = True
-            elif isinstance(x, ast.Return) and x.value is not None:
-                return_node = x
-
-            if has_yield and return_node is not None:
-                self.errors.append(
-                    B901(return_node.lineno, return_node.col_offset)
-                )
-                break
-
-            xs.extend(ast.iter_child_nodes(x))
+        return
 
     def check_for_b902(self, node):
-        if not isinstance(self.node_stack[-2], ast.ClassDef):
-            return
-
-        decorators = NameFinder()
-        decorators.visit(node.decorator_list)
-
-        if 'staticmethod' in decorators.names:
-            # TODO: maybe warn if the first argument is surprisingly `self` or
-            # `cls`?
-            return
-
-        bases = {
-            b.id
-            for b in self.node_stack[-2].bases if isinstance(b, ast.Name)
-        }
-        if 'type' in bases:
-            if (
-                'classmethod' in decorators.names or
-                node.name in B902.implicit_classmethods
-            ):
-                expected_first_args = B902.metacls
-                kind = 'metaclass class'
-            else:
-                expected_first_args = B902.cls
-                kind = 'metaclass instance'
-        else:
-            if (
-                'classmethod' in decorators.names or
-                node.name in B902.implicit_classmethods
-            ):
-                expected_first_args = B902.cls
-                kind = 'class'
-            else:
-                expected_first_args = B902.self
-                kind = 'instance'
-
-        args = node.args.args
-        vararg = node.args.vararg
-        kwarg = node.args.kwarg
-        kwonlyargs = node.args.kwonlyargs
-
-        if args:
-            actual_first_arg = args[0].arg
-            lineno = args[0].lineno
-            col = args[0].col_offset
-        elif vararg:
-            actual_first_arg = '*' + vararg.arg
-            lineno = vararg.lineno
-            col = vararg.col_offset
-        elif kwarg:
-            actual_first_arg = '**' + kwarg.arg
-            lineno = kwarg.lineno
-            col = kwarg.col_offset
-        elif kwonlyargs:
-            actual_first_arg = '*, ' + kwonlyargs[0].arg
-            lineno = kwonlyargs[0].lineno
-            col = kwonlyargs[0].col_offset
-        else:
-            actual_first_arg = '(none)'
-            lineno = node.lineno
-            col = node.col_offset
-
-        if actual_first_arg not in expected_first_args:
-            if not actual_first_arg.startswith(('(', '*')):
-                actual_first_arg = repr(actual_first_arg)
-            self.errors.append(
-                B902(
-                    lineno,
-                    col,
-                    vars=(actual_first_arg, kind, expected_first_args[0])
-                )
-            )
+        return
 
     def check_for_b903(self, node):
-        body = node.body
-        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Str):
-            # Ignore the docstring
-            body = body[1:]
-
-        if (
-            len(body) != 1 or
-            not isinstance(body[0], ast.FunctionDef) or
-            body[0].name != '__init__'
-        ):
-            # only classes with *just* an __init__ method are interesting
-            return
-
-        # all the __init__ function does is a series of assignments to attributes
-        for stmt in body[0].body:
-            if not isinstance(stmt, ast.Assign):
-                return
-            targets = stmt.targets
-            if len(targets) > 1 or not isinstance(targets[0], ast.Attribute):
-                return
-            if not isinstance(stmt.value, ast.Name):
-                return
-
-        self.errors.append(
-            B903(node.lineno, node.col_offset))
+        return
 
 
 @attr.s
 class NameFinder(ast.NodeVisitor):
-    """Finds a name within a tree of nodes.
-
-    After `.visit(node)` is called, `found` is a dict with all name nodes inside,
-    key is name string, value is the node (useful for location purposes).
-    """
+    """Finds a name within a tree of nodes."""
     names = attr.ib(default=attr.Factory(dict))
 
     def visit_Name(self, node):
         self.names.setdefault(node.id, []).append(node)
 
     def visit(self, node):
-        """Like super-visit but supports iteration over lists."""
-        if not isinstance(node, list):
-            return super().visit(node)
+        """Like super-visit but doesn't invoke visit_Name."""
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
 
-        for elem in node:
-            super().visit(elem)
-        return node
+
+def _is_identifier(arg):
+    if hasattr(ast, 'arg'):
+        return isinstance(arg, ast.arg)
+    return isinstance(arg, ast.Name)
 
 
 error = namedtuple('error', 'lineno col message type vars')
 Error = partial(partial, error, type=BugBearChecker, vars=())
 
 
+disabled_by_default = [
+    'B901',
+    'B902',
+    'B903',
+    'B950',
+]
 B001 = Error(
     message="B001 Do not use bare `except:`, it also catches unexpected "
             "events like memory errors, interrupts, system exit, and so on.  "
             "Prefer `except Exception:`.  If you're sure what you're doing, "
             "be explicit and write `except BaseException:`.",
 )
-
 B002 = Error(
     message="B002 Python does not support the unary prefix increment. Writing "
             "++n is equivalent to +(+(n)), which equals n. You meant n += 1.",
 )
-
 B003 = Error(
     message="B003 Assigning to `os.environ` doesn't clear the environment. "
             "Subprocesses are going to see outdated variables, in disagreement "
             "with the current process. Use `os.environ.clear()` or the `env=` "
             "argument to Popen.",
 )
-
 B004 = Error(
     message="B004 Using `hasattr(x, '__call__')` to test if `x` is callable "
             "is unreliable. If `x` implements custom `__getattr__` or its "
             "`__call__` is itself not callable, you might get misleading "
             "results. Use `callable(x)` for consistent results.",
 )
-
 B005 = Error(
     message="B005 Using .strip() with multi-character strings is misleading "
             "the reader. It looks like stripping a substring. Move your "
@@ -488,13 +257,11 @@ B006.mutable_calls = {
     'set',
 }
 B007 = Error(
-    message="B007 Loop control variable {!r} not used within the loop body. "
+    message="B007 Loop control variable {vars} not used within the loop body. "
             "If this is intended, start the name with an underscore.",
 )
 
 
-# Those could be false positives but it's more dangerous to let them slip
-# through if they're not.
 B301 = Error(
     message="B301 Python 3 does not include `.iter*` methods on dictionaries. "
             "Remove the `iter` prefix from the method name. For Python 2 "
@@ -520,11 +287,9 @@ B303 = Error(
             "`class MyClass(BaseClass, metaclass=...)`. For Python 2 "
             "compatibility, use `six.add_metaclass`.",
 )
-
 B304 = Error(
     message="B304 `sys.maxint` is not a thing on Python 3. Use `sys.maxsize`.",
 )
-
 B305 = Error(
     message="B305 `.next()` is not a thing on Python 3. Use the `next()` "
             "builtin. For Python 2 compatibility, use `six.next()`.",
@@ -538,15 +303,14 @@ B306 = Error(
             "user-readable message. Use `e.args` to access arguments passed "
             "to the exception.",
 )
-
 B901 = Error(
     message="B901 Using `yield` together with `return x`. Use native "
             "`async def` coroutines or put a `# noqa` comment on this "
             "line if this was intentional.",
 )
 B902 = Error(
-    message="B902 Invalid first argument {} used for {} method. Use the "
-            "canonical first argument name in methods, i.e. {}."
+    message="B902 Invalid first argument {vars} used for {vars} method. Use the "
+            "canonical first argument name in methods, i.e. {vars}.",
 )
 B902.implicit_classmethods = {'__new__', '__init_subclass__'}
 B902.self = ['self']  # it's a list because the first is preferred
@@ -555,12 +319,10 @@ B902.metacls = ['metacls', 'metaclass', 'typ']  # ditto.
 
 B903 = Error(
     message="B903 Data class should either be immutable or use __slots__ to "
-            "save memory. Use collections.namedtuple to generate an immutable "
-            "class, or enumerate the attributes in a __slot__ declaration in "
-            "the class to leave attributes mutable.")
-
-B950 = Error(
-    message='B950 line too long ({} > {} characters)',
+            "save memory. Use collections.namedtuple to generate an "
+            "immutable class, or enumerate the attributes in a __slot__ "
+            "declaration in the class to leave attributes mutable.",
 )
-
-disabled_by_default = ["B901", "B902", "B903", "B950"]
+B950 = Error(
+    message="B950 line too long ({vars} > {vars} characters)",
+)
